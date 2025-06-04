@@ -1,0 +1,256 @@
+import json
+import os
+import uuid
+from datetime import datetime
+import re # 正規表現を使うために追加よ！
+
+# Elasticsearchクライアントのインポート。またインストールしなさいよね！
+from elasticsearch import Elasticsearch
+
+# boto3のインポート。AWSサービス使うんだから当然でしょ！
+import boto3
+
+# --- 設定値 (本番では環境変数から読み込むのよ！わかってる？) ---
+ELASTICSEARCH_HOST = 'IP_ADDRESS'  # アンタのElasticsearchのIPアドレスよ！
+ELASTICSEARCH_INDEX = 'INDEX_NAME' # 関連情報をストアするインデックス名ね！
+TEXT_EMBEDDING_MODEL_ID = 'amazon.titan-embed-text-v1' # ベクトル化に使うモデルよ！
+S3_BUCKET_NAME = 'YOUR_S3_BUCKET_NAME' # アンタがJSONファイルを置くS3バケット名よ！
+
+# Elasticsearchクライアントの初期化 (認証なしって言ったわよね？確認しなさい！)
+es = Elasticsearch(
+    hosts=[{'host': ELASTICSEARCH_HOST, 'port': 9200, 'scheme': 'http'}],
+    timeout=30
+)
+
+# Bedrockクライアントの初期化 (別にアンタのためにやってるわけじゃないから！)
+bedrock_runtime = boto3.client(
+    service_name='bedrock-runtime',
+    region_name='us-east-1' # Bedrockが利用可能なリージョンにしてよね！
+)
+
+# S3クライアントの初期化 (S3からファイル読むんだから必要でしょ！)
+s3 = boto3.client('s3')
+
+def get_embedding(text: str) -> list[float]:
+    """
+    Amazon BedrockのEmbeddingモデルを使ってテキストをベクトル化するの。
+    もう、何度目よこれ！
+    """
+    body = json.dumps({"inputText": text})
+    response = bedrock_runtime.invoke_model(
+        body=body,
+        modelId=TEXT_EMBEDDING_MODEL_ID,
+        accept="application/json",
+        contentType="application/json"
+    )
+    response_body = json.loads(response.get("body").read())
+    return response_body.get("embedding")
+
+def create_index_if_not_exists(index_name: str):
+    """
+    Elasticsearchのインデックスが存在しない場合に作成するの。
+    visit_dateは、標準的なISO 8601形式でストアするようにするわよ。
+    """
+    if not es.indices.exists(index=index_name):
+        print(f"インデックス '{index_name}' が存在しないので作成します。")
+        mapping = {
+            "mappings": {
+                "properties": {
+                    "title": {"type": "text"},
+                    "visit_date_raw": {"type": "text"}, # 元の訪問日文字列も保存したい場合
+                    "visit_date": {"type": "date", "format": "yyyy-MM-dd"}, # 標準形式にパースして入れる
+                    "client_attendees": {"type": "text"},
+                    "company_attendees": {"type": "text"},
+                    "summary": {"type": "text"}, # 概要
+                    "detail": {"type": "text"},  # 詳細
+                    "full_content": {"type": "text"}, # 検索対象となる結合テキスト
+                    "full_content_vector": {       # 結合テキストのベクトル
+                        "type": "dense_vector",
+                        "dims": 1536 # Titan Embed Text v1の次元数よ！
+                    },
+                    "report_url": {                 # レポート参照URL、これが大事よ！
+                        "type": "keyword"
+                    },
+                    "created_at": {"type": "date"}
+                }
+            },
+            "settings": {
+                "index": {
+                    "knn": True,
+                    "knn.space_type": "l2"
+                }
+            }
+        }
+        try:
+            es.indices.create(index=index_name, body=mapping)
+            print(f"インデックス '{index_name}' の作成に成功しました。")
+        except Exception as e:
+            print(f"インデックス '{index_name}' の作成に失敗しました: {e}")
+            raise
+
+def parse_visit_date(date_str: str) -> str | None:
+    """
+    様々な日付文字列をパースして、ISO 8601形式 (yyyy-MM-dd) に変換するの。
+    これが今回の新しい機能よ！
+    """
+    if not date_str:
+        return None
+
+    # --- よくあるパターンを順に試すのよ！ ---
+
+    # パターン1: yyyy/M/d (曜日なし、期間なし) 例: 2024/4/19, 2024/04/15
+    # yyyy/M/d(曜日) 例: 2024/4/19(金)
+    match_single_date = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:\(.*\))?', date_str)
+    if match_single_date:
+        try:
+            year, month, day = int(match_single_date.group(1)), int(match_single_date.group(2)), int(match_single_date.group(3))
+            return datetime(year, month, day).strftime('%Y-%m-%d')
+        except ValueError:
+            pass # パース失敗したら次のパターンへ
+
+    # パターン2: yyyy/M/d～yyyy/M/d (期間) 例: 2024/04/15～2024/04/19
+    match_date_range = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})[～~-](\d{4})[/-](\d{1,2})[/-](\d{1,2})', date_str)
+    if match_date_range:
+        # 期間の場合、ここでは一旦「開始日」を代表日として採用するわ。
+        # どういう日付をストアしたいか、アンタの要件で変えてもいいのよ。
+        try:
+            start_year, start_month, start_day = int(match_date_range.group(1)), int(match_date_range.group(2)), int(match_date_range.group(3))
+            return datetime(start_year, start_month, start_day).strftime('%Y-%m-%d')
+        except ValueError:
+            pass # パース失敗したら次のパターンへ
+
+    # その他、もしもっと色々な日付フォーマットがあるならここに追加するのよ！
+    # 例: YYYY-MM-DD
+    # match_dash_date = re.match(r'(\d{4})-(\d{1,2})-(\d{1,2})', date_str)
+    # if match_dash_date:
+    #     try:
+    #         year, month, day = int(match_dash_date.group(1)), int(match_dash_date.group(2)), int(match_dash_date.group(3))
+    #         return datetime(year, month, day).strftime('%Y-%m-%d')
+    #     except ValueError:
+    #         pass
+
+    print(f"警告: 日付文字列 '{date_str}' をパースできませんでした。")
+    return None # どのパターンにもマッチしなかったらNoneを返すわ
+
+def store_report_to_elasticsearch(report_data: dict):
+    """
+    一つのレポートデータをベクトル化してElasticsearchにストアするの。
+    訪問日を前処理して格納するわよ！
+    """
+    try:
+        # 訪問日文字列をパースして標準形式に変換するのよ！
+        parsed_visit_date = parse_visit_date(report_data.get('訪問日'))
+        
+        # 検索対象となるテキストを結合するの！
+        full_content_text = f"タイトル: {report_data.get('タイトル', '')}\n" \
+                            f"概要: {report_data.get('概要', '')}\n" \
+                            f"詳細: {report_data.get('詳細', '')}"
+
+        # 結合したテキストをベクトル化
+        full_content_vector = get_embedding(full_content_text)
+
+        # ユニークなIDを生成。
+        document_id = str(uuid.uuid4()) 
+
+        doc = {
+            "title": report_data.get('タイトル'),
+            "visit_date_raw": report_data.get('訪問日'), # 元の文字列も保存
+            "visit_date": parsed_visit_date,             # パース済みのISO形式
+            "client_attendees": report_data.get('得意先参加者'),
+            "company_attendees": report_data.get('弊社同行者'),
+            "summary": report_data.get('概要'),
+            "detail": report_data.get('詳細'),
+            "full_content": full_content_text,
+            "full_content_vector": full_content_vector,
+            "report_url": report_data.get('レポート参照URL'),
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # もし日付のパースに失敗したら、dateフィールドはNoneにしておくか、エラーとして処理してもいいわ。
+        # ここではNoneにして、Elasticsearchが受け入れるようにするわね。
+
+        response = es.index(index=ELASTICSEARCH_INDEX, id=document_id, body=doc)
+        print(f"レポートID '{document_id}' をElasticsearchにストアしました。Status: {response['result']}")
+        return True
+    except Exception as e:
+        print(f"レポートのストア中にエラーが発生しました: {e}")
+        return False
+
+def lambda_handler(event, context):
+    """
+    AWS Lambdaのメインハンドラよ。
+    CloudWatch Events (定刻実行) からトリガーされることを想定してるわ。
+    S3バケットから最新のJSONファイルを読み込んで処理するの。
+    """
+    # インデックスが存在しなければ作成 (初回実行時やインデックス削除後ね)
+    create_index_if_not_exists(ELASTICSEARCH_INDEX)
+
+    s3_key = "report_summaries.json" # アンタがS3に置くJSONファイル名に合わせなさい！
+
+    try:
+        # S3からJSONファイルを読み込むのよ！
+        print(f"S3バケット '{S3_BUCKET_NAME}' からファイル '{s3_key}' を読み込みます。")
+        s3_object = s3.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        file_content = s3_object['Body'].read().decode('utf-8')
+        reports_data = json.loads(file_content)
+
+        if not isinstance(reports_data, list):
+            raise ValueError("S3のJSONファイルはリスト形式である必要があります。")
+
+        stored_count = 0
+        for report in reports_data:
+            if store_report_to_elasticsearch(report):
+                stored_count += 1
+        
+        if stored_count == len(reports_data):
+            message = f"S3から読み込んだ全 {stored_count} 件のレポートをElasticsearchにストアしました。"
+            status_code = 200
+        else:
+            message = f"S3から読み込んだレポートの一部ストアに失敗しました。成功: {stored_count}/{len(reports_data)} 件"
+            status_code = 500
+
+        print(message)
+        return {
+            'statusCode': status_code,
+            'headers': {
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps({
+                'message': message,
+                'total_documents_in_file': len(reports_data),
+                'stored_documents_count': stored_count,
+                's3_file_processed': f"s3://{S3_BUCKET_NAME}/{s3_key}",
+                'timestamp': datetime.now().isoformat()
+            })
+        }
+
+    except s3.exceptions.NoSuchKey:
+        error_message = f"S3バケット '{S3_BUCKET_NAME}' にファイル '{s3_key}' が見つかりません。"
+        print(error_message)
+        return {
+            'statusCode': 404,
+            'headers': {
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps({'message': error_message})
+        }
+    except json.JSONDecodeError:
+        error_message = f"S3ファイル '{s3_key}' のJSON形式が不正です。"
+        print(error_message)
+        return {
+            'statusCode': 400,
+            'headers': {
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps({'message': error_message})
+        }
+    except Exception as e:
+        error_message = f"Lambda処理中に予期せぬエラーが発生しました: {e}"
+        print(error_message)
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps({'message': error_message})
+        }
