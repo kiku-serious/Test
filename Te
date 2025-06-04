@@ -6,33 +6,56 @@ from datetime import datetime
 # Elasticsearchクライアントのインポート。これがないと動かないわよ！
 from elasticsearch import Elasticsearch
 
-# --- 設定値 (本番環境では環境変数で設定するのよ！絶対だからね！) ---
-# ELASTICSEARCH_HOST = os.environ.get('ELASTICSEARCH_HOST', 'IP_ADDRESS') # ElasticsearchのIPアドレスよ！
-# ELASTICSEARCH_INDEX = os.environ.get('ELASTICSEARCH_INDEX', 'INDEX_NAME') # 関連情報がストアされてるインデックス名ね！
-# TEXT_EMBEDDING_MODEL_ID = os.environ.get('TEXT_EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v1') # 質問をベクトル化するモデルよ！
-# LLM_MODEL_ID = os.environ.get('LLM_MODEL_ID', 'anthropic.claude-3-sonnet-20240229-v1:0') # 回答生成に使うLLMね！
+# --- 設定値 (ここをちゃんと環境変数から読み込むようにするのよ！) ---
+ELASTICSEARCH_HOST = os.environ.get('ELASTICSEARCH_HOST', 'IP_ADDRESS') # ElasticsearchのIPアドレスよ！
+ELASTICSEARCH_INDEX = os.environ.get('ELASTICSEARCH_INDEX', 'INDEX_NAME') # 関連情報がストアされてるインデックス名ね！
+TEXT_EMBEDDING_MODEL_ID = os.environ.get('TEXT_EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v1') # 質問をベクトル化するモデルよ！
 
-ELASTICSEARCH_HOST = 'IP_ADDRESS'  # アンタのElasticsearchのIPアドレスよ！
-ELASTICSEARCH_INDEX = 'INDEX_NAME' # 関連情報がストアされてるインデックス名よ！
-TEXT_EMBEDDING_MODEL_ID = 'amazon.titan-embed-text-v1' # 質問をベクトル化するモデルよ！
-LLM_MODEL_ID = 'anthropic.claude-3-sonnet-20240229-v1:0' # 回答生成に使うLLMね！
+# LLMの設定は環境変数で柔軟に指定できるようにするわ！
+# 例: LLM_MODEL_ID='anthropic.claude-3-sonnet-20240229-v1:0'
+# 例: LLM_MODEL_TYPE='anthropic'
+# 例: LLM_MODEL_ID='mistral.mistral-7b-instruct-v0:2'
+# 例: LLM_MODEL_TYPE='mistral'
+LLM_MODEL_ID = os.environ.get('LLM_MODEL_ID', 'anthropic.claude-3-sonnet-20240229-v1:0')
+LLM_MODEL_TYPE = os.environ.get('LLM_MODEL_TYPE', 'anthropic') # 'anthropic', 'mistral', 'amazon' など、LLMの種類に応じて切り替えるわ
 
-# Elasticsearchクライアントの初期化 (認証なしって言ったわよね？簡単ね！)
+# --- LLMプロンプトの定義 (ここを読めばプロンプトがわかるようにしてあげたわよ！) ---
+# 関連情報が見つかった場合のプロンプトテンプレート
+RAG_PROMPT_TEMPLATE = """以下の「関連情報」と「ユーザーからの質問」を参考に、質問に答えてください。
+回答には、関連情報から取得したレポートのURLを含めてください。URLがない場合は不要です。
+もし関連情報に十分な情報がない場合は、「関連情報が不足しているため、この質問にはお答えできません。」と回答してください。
+
+<関連情報>
+{context_str}
+</関連情報>
+
+<ユーザーからの質問>
+{user_question}
+</ユーザーからの質問>
+
+回答:
+"""
+
+# 関連情報が見つからなかった場合のプロンプトテンプレート
+NO_RAG_PROMPT_TEMPLATE = """ユーザーからの質問: {user_question}
+
+関連情報が見つかりませんでした。質問に答えられない場合は、「関連情報が不足しているため、この質問にはお答えできません。」と回答してください。"""
+
+# --- Elasticsearchクライアントの初期化 ---
 es = Elasticsearch(
     hosts=[{'host': ELASTICSEARCH_HOST, 'port': 9200, 'scheme': 'http'}],
-    timeout=30 # タイムアウトも設定しといてあげたわ
+    timeout=30
 )
 
-# Bedrockクライアントの初期化 (別にアンタのためにやってるわけじゃないから！)
+# --- Bedrockクライアントの初期化 ---
 bedrock_runtime = boto3.client(
     service_name='bedrock-runtime',
-    region_name='us-east-1' # Bedrockが利用可能なリージョンに合わせなさいよ！
+    region_name=os.environ.get('AWS_REGION', 'us-east-1') # AWS_REGIONも環境変数から取得するようにしておいたわ
 )
 
 def get_embedding(text: str) -> list[float]:
     """
     Amazon BedrockのEmbeddingモデルを使ってテキストをベクトル化するの。
-    質問文をベクトルに変換するのに使うわよ。
     """
     body = json.dumps({"inputText": text})
     response = bedrock_runtime.invoke_model(
@@ -47,54 +70,48 @@ def get_embedding(text: str) -> list[float]:
 def hybrid_search_elasticsearch(query_text: str, k: int = 5) -> list[dict]:
     """
     Elasticsearchでハイブリッド検索を行うの。
-    キーワード検索とベクトル検索を組み合わせるから、より賢く関連情報を見つけられるわ。
-    レポート参照URLもちゃんと取得できるようにするわよ！
     """
     try:
-        # ユーザーの質問をベクトル化
         query_embedding = get_embedding(query_text)
 
-        # ハイブリッド検索クエリの作成よ！
         search_query = {
             "query": {
                 "bool": {
                     "must": [
                         {
-                            "multi_match": { # 複数のテキストフィールドからキーワード検索できるようにしてあげたわ
+                            "multi_match": {
                                 "query": query_text,
-                                "fields": ["title", "summary", "detail", "full_content"] # どこを検索するか指定しなさい！
+                                "fields": ["title", "summary", "detail", "full_content"]
                             }
                         }
                     ],
                     "should": [
                         {
                             "query_vector": {
-                                "full_content_vector": { # ベクトルはfull_content_vectorフィールドからね！
+                                "full_content_vector": {
                                     "query_vector": query_embedding,
                                     "k": k
                                 }
                             }
                         }
                     ],
-                    "minimum_should_match": 0 # should句は必須じゃないけど、スコアに影響させるの
+                    "minimum_should_match": 0
                 }
             },
-            "size": k, # 最終的に返す件数
-            "_source": ["title", "summary", "detail", "report_url", "full_content"] # LLMに渡すフィールドとURLを指定
+            "size": k,
+            "_source": ["title", "summary", "detail", "report_url", "full_content"]
         }
 
         print(f"Elasticsearch Search Query: {json.dumps(search_query, indent=2)}")
 
         response = es.search(index=ELASTICSEARCH_INDEX, body=search_query)
         
-        # 検索結果から関連情報とURLを抽出
         retrieved_docs = []
         for hit in response["hits"]["hits"]:
             source = hit["_source"]
-            # LLMに渡すテキストはfull_contentでいいわね。URLも忘れずに。
             retrieved_docs.append({
-                "content": source.get("full_content", source.get("summary", "")), # full_contentがなければsummaryを使うとか
-                "report_url": source.get("report_url", "N/A") # URLがなかったらN/Aにするわ
+                "content": source.get("full_content", source.get("summary", "")),
+                "report_url": source.get("report_url", "N/A")
             })
         
         print(f"Retrieved Contexts: {retrieved_docs}")
@@ -107,10 +124,9 @@ def hybrid_search_elasticsearch(query_text: str, k: int = 5) -> list[dict]:
 def invoke_llm_with_context(user_question: str, contexts: list[dict]) -> str:
     """
     取得した関連情報とユーザーの質問を使って、BedrockのLLMに回答を生成させるの。
-    レポート参照URLも回答に含めるように指示してあげるわ。
+    LLM_MODEL_TYPEに応じてプロンプトとbodyを生成するわよ！
     """
     context_str = ""
-    # レポート参照URLも回答に含めるようにプロンプトに指示するのよ！
     if contexts:
         for i, ctx in enumerate(contexts):
             context_str += f"<関連情報 {i+1}>\n"
@@ -119,38 +135,45 @@ def invoke_llm_with_context(user_question: str, contexts: list[dict]) -> str:
                 context_str += f"参照URL: {ctx['report_url']}\n"
             context_str += f"</関連情報 {i+1}>\n\n"
     
-    if not context_str.strip(): # コンテキストが空の場合
-        prompt = f"""ユーザーからの質問: {user_question}
-        
-関連情報が見つかりませんでした。質問に答えられない場合は、「関連情報が不足しているため、この質問にはお答えできません。」と回答してください。"""
+    # コンテキストの有無でプロンプトを切り替えるわ
+    if not context_str.strip():
+        prompt = NO_RAG_PROMPT_TEMPLATE.format(user_question=user_question)
     else:
-        # プロンプトの組み立て。これがRAGのキモよ！
-        prompt = f"""以下の「関連情報」と「ユーザーからの質問」を参考に、質問に答えてください。
-回答には、関連情報から取得したレポートのURLを含めてください。URLがない場合は不要です。
-もし関連情報に十分な情報がない場合は、「関連情報が不足しているため、この質問にはお答えできません。」と回答してください。
+        prompt = RAG_PROMPT_TEMPLATE.format(context_str=context_str, user_question=user_question)
 
-<関連情報>
-{context_str}
-</関連情報>
-
-<ユーザーからの質問>
-{user_question}
-</ユーザーからの質問>
-
-回答:
-"""
-    
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "messages": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": prompt}]
+    # LLMのモデルタイプに応じてリクエストボディを構築するのよ！
+    # これでAnthropic以外も柔軟に対応できるでしょ？
+    body = {}
+    if LLM_MODEL_TYPE == 'anthropic':
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}]
+                }
+            ],
+            "max_tokens": 1000,
+            "temperature": 0.7,
+        })
+    elif LLM_MODEL_TYPE == 'mistral':
+        body = json.dumps({
+            "prompt": f"<s>[INST] {prompt} [/INST]", # Mistralのインストラクション形式に合わせるわ
+            "max_tokens": 1000,
+            "temperature": 0.7,
+        })
+    elif LLM_MODEL_TYPE == 'amazon': # 例えばAmazon Titan Text Express/Lite V1の場合
+        body = json.dumps({
+            "inputText": prompt,
+            "textGenerationConfig": {
+                "maxTokenCount": 1000,
+                "temperature": 0.7,
             }
-        ],
-        "max_tokens": 1000,
-        "temperature": 0.7,
-    })
+        })
+    else:
+        # 未知のモデルタイプならエラーを出すか、デフォルトの形式で試すか。今回はエラーを出すわ
+        print(f"エラー: 未知のLLM_MODEL_TYPE: {LLM_MODEL_TYPE}")
+        return "申し訳ありませんが、設定されたLLMモデルタイプに対応できません。"
 
     try:
         response = bedrock_runtime.invoke_model(
@@ -160,7 +183,17 @@ def invoke_llm_with_context(user_question: str, contexts: list[dict]) -> str:
             contentType="application/json"
         )
         response_body = json.loads(response.get("body").read())
-        return response_body["content"][0]["text"]
+        
+        # モデルタイプによってレスポンスのパース方法も変わるから注意よ！
+        if LLM_MODEL_TYPE == 'anthropic':
+            return response_body["content"][0]["text"]
+        elif LLM_MODEL_TYPE == 'mistral':
+            return response_body["outputs"][0]["text"]
+        elif LLM_MODEL_TYPE == 'amazon':
+            return response_body["results"][0]["outputText"]
+        else:
+            return "申し訳ありませんが、回答を解析できませんでした。"
+
     except Exception as e:
         print(f"Bedrock LLMの呼び出し中にエラーが発生しました: {e}")
         return "申し訳ありませんが、回答を生成できませんでした。"
@@ -168,28 +201,18 @@ def invoke_llm_with_context(user_question: str, contexts: list[dict]) -> str:
 def lambda_handler(event, context):
     """
     AWS Lambdaのメインハンドラよ。
-    この関数が、ユーザーの質問を受け取って、RAGプロセスを実行し、回答を返すの。
     """
-    # 暫定的なユーザーの質問 (後でAPI Gatewayなどと連携させる時に変更するのよ！)
-    # eventオブジェクトから質問を受け取る形式にするのが一般的よ。
-    # 例: user_question = event.get('question', 'デフォルトの質問')
-    user_question = "AWS Lambdaとは何ですか？また、それに関するレポートがあればURLを教えてください。" # アンタの質問を変えなさい！
-    # user_question = "出張報告レポートの概要と詳細を教えてください。"
-    # user_question = "Amazon BedrockでLLMを呼び出す方法を教えてください。"
-    # user_question = "最近の出張報告について教えてください。"
+    # 暫定的なユーザーの質問 (API Gatewayと連携させる時に変更するのよ！)
+    user_question = "AWS Lambdaとは何ですか？また、それに関するレポートがあればURLを教えてください。"
 
     print(f"ユーザーからの質問: {user_question}")
 
-    # 1. Elasticsearchから関連情報を取得 (ハイブリッド検索よ！)
-    # 取得するドキュメントの件数も調整できるわ (k=5)
     retrieved_contexts = hybrid_search_elasticsearch(user_question, k=5)
 
-    # 2. 取得した関連情報とユーザーの質問をLLMに入力して回答を生成
     llm_answer = invoke_llm_with_context(user_question, retrieved_contexts)
 
     print(f"LLMからの回答: {llm_answer}")
 
-    # 3. 回答を返す (Lambdaのレスポンス形式よ！)
     return {
         'statusCode': 200,
         'headers': {
@@ -198,7 +221,7 @@ def lambda_handler(event, context):
         'body': json.dumps({
             'question': user_question,
             'answer': llm_answer,
-            'retrieved_contexts': retrieved_contexts, # どんな関連情報が使われたか、一応見れるようにしといてあげる
+            'retrieved_contexts': retrieved_contexts,
             'timestamp': datetime.now().isoformat()
         })
     }
