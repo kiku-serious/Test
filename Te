@@ -123,4 +123,107 @@ def store_report_to_elasticsearch(report_data: dict, s3_source_key: str):
     try:
         parsed_visit_date = parse_visit_date(report_data.get('訪問日'))
         
-        full_content_text = f"タイトル:
+        full_content_text = f"タイトル: {report_data.get('タイトル', '')}\n" \
+                            f"概要: {report_data.get('概要', '')}\n" \
+                            f"詳細: {report_data.get('詳細', '')}"
+
+        full_content_vector = get_embedding(full_content_text)
+
+        # ドキュメントIDはS3キーとレポートのタイトル（またはハッシュ値）を組み合わせるのが良いわ
+        # これなら、同じS3ファイル内の同じタイトルのレポートが重複登録されにくくなるわね。
+        # 単純なUUIDでも良いけど、ファイル名からのトレーサビリティを考えるとこれが賢いわ。
+        document_id = f"{s3_source_key.replace('.', '_')}_{uuid.uuid5(uuid.NAMESPACE_URL, report_data.get('タイトル', ''))}"
+
+        doc = {
+            "title": report_data.get('タイトル'),
+            "visit_date_raw": report_data.get('訪問日'),
+            "visit_date": parsed_visit_date,
+            "client_attendees": report_data.get('得意先参加者'),
+            "company_attendees": report_data.get('弊社同行者'),
+            "summary": report_data.get('概要'),
+            "detail": report_data.get('詳細'),
+            "full_content": full_content_text,
+            "full_content_vector": full_content_vector,
+            "report_url": report_data.get('レポート参照URL'),
+            "s3_source_key": s3_source_key, # どのS3ファイルから来たか
+            "created_at": datetime.now().isoformat()
+        }
+
+        response = es.index(index=ELASTICSEARCH_INDEX, id=document_id, body=doc)
+        print(f"ストアしました - S3 Key: {s3_source_key}, Report Title: {report_data.get('タイトル', 'N/A')}, Document ID: {document_id}. Status: {response['result']}")
+        return True
+    except Exception as e:
+        print(f"レポートのストア中にエラーが発生しました - S3 Key: {s3_source_key}, Report Title: {report_data.get('タイトル', 'N/A')}: {e}")
+        return False
+
+def lambda_handler(event, context):
+    """
+    AWS Lambdaのメインハンドラよ。
+    S3バケット内の全てのJSONファイルを列挙し、それぞれを処理するの。
+    """
+    # インデックスが存在しなければ作成
+    create_index_if_not_exists(ELASTICSEARCH_INDEX)
+
+    total_files_processed = 0
+    total_reports_stored = 0
+    
+    # S3バケット内のJSONファイルを全て列挙するのよ！
+    # list_objects_v2はデフォルトで1000件ずつしか返さないから、継続トークンを使って全て取得するの。
+    # アンタの言う2000ファイル以上でも大丈夫よ！
+    continuation_token = None
+    while True:
+        if continuation_token:
+            response = s3.list_objects_v2(Bucket=S3_BUCKET_NAME, ContinuationToken=continuation_token)
+        else:
+            response = s3.list_objects_v2(Bucket=S3_BUCKET_NAME)
+
+        # JSONファイルだけをフィルタリングしてあげる。小文字でも大文字でも対応できるようにするわ。
+        json_files = [obj for obj in response.get('Contents', []) if obj['Key'].lower().endswith('.json')]
+
+        for s3_object in json_files:
+            s3_key = s3_object['Key']
+            print(f"S3からファイル '{s3_key}' を読み込みます。")
+            
+            try:
+                file_content = s3.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)['Body'].read().decode('utf-8')
+                reports_data = json.loads(file_content)
+
+                if not isinstance(reports_data, list):
+                    print(f"警告: S3ファイル '{s3_key}' のJSON形式がリストではありません。スキップします。")
+                    continue # リストじゃないなら次のファイルへ
+
+                reports_in_file_count = 0
+                for report in reports_data:
+                    if store_report_to_elasticsearch(report, s3_key): # s3_keyも渡すようにしたわ
+                        reports_in_file_count += 1
+                
+                print(f"ファイル '{s3_key}' から {reports_in_file_count} 件のレポートをストアしました。")
+                total_files_processed += 1
+                total_reports_stored += reports_in_file_count
+
+            except json.JSONDecodeError:
+                print(f"エラー: S3ファイル '{s3_key}' のJSON形式が不正です。スキップします。")
+            except Exception as e:
+                print(f"エラー: S3ファイル '{s3_key}' の処理中に予期せぬエラーが発生しました: {e}")
+
+        # 次のページがあるか確認
+        if response.get('IsTruncated'):
+            continuation_token = response.get('NextContinuationToken')
+        else:
+            break # 全てのファイルが処理されたらループを抜ける
+
+    message = f"S3バケット内の処理が完了しました。処理したファイル数: {total_files_processed} 件、ストアしたレポート総数: {total_reports_stored} 件。"
+    print(message)
+
+    return {
+        'statusCode': 200,
+        'headers': {
+            'Content-Type': 'application/json'
+        },
+        'body': json.dumps({
+            'message': message,
+            'total_files_processed': total_files_processed,
+            'total_reports_stored': total_reports_stored,
+            'timestamp': datetime.now().isoformat()
+        })
+    }
