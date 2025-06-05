@@ -1,0 +1,112 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Step Functions workflow for parallel S3 JSON file processing and Elasticsearch vector registration.
+
+Resources:
+  # Step Functions State Machine Definition
+  S3ToElasticsearchVectorRegistrationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: S3ElasticsearchVectorRegistrationWorkflow
+      DefinitionString: !Sub |
+        {
+          "Comment": "Processes S3 JSON files in parallel and registers vectors to Elasticsearch.",
+          "StartAt": "ListS3Files",
+          "States": {
+            "ListS3Files": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:ap-northeast-1:857159678122:function:ListS3FilesLambda",
+              "Next": "CheckFileList"
+            },
+            "CheckFileList": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.batches",
+                  "IsPresent": true,
+                  "Next": "ProcessFilesConcurrently"
+                }
+              ],
+              "Default": "NoFilesFound"
+            },
+            "NoFilesFound": {
+              "Type": "Succeed",
+              "Comment": "No files found to process."
+            },
+            "ProcessFilesConcurrently": {
+              "Type": "Map",
+              "ItemsPath": "$.batches",
+              "MaxConcurrency": 10,
+              "Iterator": {
+                "StartAt": "ProcessSingleFile",
+                "States": {
+                  "ProcessSingleFile": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:lambda:ap-northeast-1:857159678122:function:ProcessSingleFileSimpleLambda",
+                    "InputPath": "$",
+                    "End": true
+                  }
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+
+  # IAM Role for Step Functions Execution
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: StepFunctionsS3ToElasticsearchExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub states.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsLambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:ap-northeast-1:857159678122:function:ListS3FilesLambda"
+                  - !Sub "arn:aws:lambda:ap-northeast-1:857159678122:function:ProcessSingleFileSimpleLambda"
+
+  # EventBridge (formerly CloudWatch Events) Rule for Scheduling
+  EventBridgeRuleForWorkflow:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: RunS3ToElasticsearchVectorRegistrationDaily
+      Description: Triggers the Step Functions workflow daily at JST 4:00 AM.
+      ScheduleExpression: cron(0 19 * * ? *) # JST 4:00 AM is UTC 19:00 (without daylight saving time consideration)
+      State: ENABLED
+      Targets:
+        - Id: StepFunctionsTarget
+          Arn: !GetAtt S3ToElasticsearchVectorRegistrationStateMachine.Arn
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  # IAM Role for EventBridge Execution
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EventBridgeStartStepFunctionsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeInvokeStepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !GetAtt S3ToElasticsearchVectorRegistrationStateMachine.Arn
