@@ -8,7 +8,8 @@ import boto3
 # これらの環境変数はLambdaの環境変数として設定される
 ELASTICSEARCH_HOST = os.environ.get("ELASTICSEARCH_HOST") # Elasticsearchのエンドポイント (必須)
 ELASTICSEARCH_INDEX_NAME = os.environ.get("ELASTICSEARCH_INDEX_NAME") # Elasticsearchのインデックス名 (必須)
-S3_BUCKET_NAME = os.environ.get("BUCKET_NAME") # S3バケット名 (必須)
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME") # S3バケット名 (必須)
+S3_INPUT_PREFIX = os.environ.get("S3_INPUT_PREFIX", "processed_historical_reports/") # 処理対象S3ファイルのプレフィックス (必須)
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1") # S3クライアント初期化用リージョン
 
 # --- AWSクライアントの初期化 ---
@@ -23,6 +24,44 @@ def get_elasticsearch_client():
     if not es_client_instance.ping():
         raise ConnectionError(f"Elasticsearchホスト {ELASTICSEARCH_HOST} への接続に失敗したわ！")
     return es_client_instance
+
+# --- S3からJSONファイルをリストアップする関数 (あんたの提供コードを統合) ---
+def list_json_files():
+    if not S3_BUCKET_NAME:
+        raise ValueError("S3_BUCKET_NAME環境変数が設定されてないわよ！")
+
+    # input_prefix は環境変数 S3_INPUT_PREFIX から取得
+    input_prefix = S3_INPUT_PREFIX
+    
+    files = []
+    continuation_token = None
+
+    while True:
+        if continuation_token:
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET_NAME,
+                Prefix=input_prefix,
+                ContinuationToken=continuation_token
+            )
+        else:
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET_NAME,
+                Prefix=input_prefix,
+            )
+        
+        if 'Contents' in response:
+            files.extend(response['Contents'])
+        
+        if 'NextContinuationToken' in response:
+            continuation_token = response['NextContinuationToken']
+        else:
+            break
+
+    # ファイル名 (Key) だけを抽出し、.json で終わるものに絞る
+    # list_objects_v2 が返すのはオブジェクト全体の情報 (辞書) なので、obj['Key'] を使う
+    json_keys = [obj['Key'] for obj in files if obj['Key'].endswith('.json')]
+    return json_keys
+
 
 # --- Elasticsearchへのインデックス関数 ---
 def index_data_to_elasticsearch(es_client, report_data: dict):
@@ -66,63 +105,76 @@ def lambda_handler(event, context):
     print("Lambda関数が実行されたわ。")
     
     # 環境変数の必須チェック
-    required_envs = ['ELASTICSEARCH_HOST', 'ELASTICSEARCH_INDEX_NAME', 'S3_BUCKET_NAME']
+    required_envs = ['ELASTICSEARCH_HOST', 'ELASTICSEARCH_INDEX_NAME', 'S3_BUCKET_NAME', 'S3_INPUT_PREFIX']
     for env_var in required_envs:
         if not os.environ.get(env_var):
             raise ValueError(f"必須環境変数 '{env_var}' が設定されてないわよ！")
 
-    s3_key = None
-    # S3イベントトリガーの場合、event['Records']からs3_keyを取得
-    if 'Records' in event: 
-        for record in event['Records']:
-            if 's3' in record:
-                s3_key = record['s3']['object']['key']
-                break
-    elif 's3_key' in event: # Step Functionsから直接keyが渡された場合
-        s3_key = event['s3_key']
-
-    if not s3_key:
-        raise ValueError("S3オブジェクトキーがイベントまたはペイロードで指定されてないわよ！")
+    print(f"S3バケット '{S3_BUCKET_NAME}' のプレフィックス '{S3_INPUT_PREFIX}' からJSONファイルをリストするわ。")
     
-    print(f"S3からオブジェクト '{s3_key}' を読み込み中よ。")
-
+    all_json_keys = []
+    
     try:
-        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
-        file_content = response['Body'].read().decode('utf-8')
-        reports_from_s3 = json.loads(file_content)
-
-        if not reports_from_s3:
-            print(f"S3オブジェクト '{s3_key}' に処理すべきレポートが見つからなかったわ。")
+        # あんたの list_json_files() 関数を使ってS3オブジェクトキーを取得
+        all_json_keys = list_json_files()
+        
+        if not all_json_keys:
+            print(f"S3バケット '{S3_BUCKET_NAME}' のプレフィックス '{S3_INPUT_PREFIX}' にJSONファイルが見つからなかったわ。")
             return {
                 "statusCode": 200,
-                "body": json.dumps("処理すべきレポートがなかったわ。")
+                "body": json.dumps("インデックスすべきJSONファイルがS3に見つからなかったわ。")
             }
 
+        print(f"合計 {len(all_json_keys)} 個のJSONファイルが見つかったわ。")
+        
         es_client = get_elasticsearch_client()
+        total_reports_indexed = 0
+        total_files_processed = 0
 
-        successful_indexes = 0
-        for report in reports_from_s3:
-            if index_data_to_elasticsearch(es_client, report):
-                successful_indexes += 1
-            
-        if successful_indexes == len(reports_from_s3):
-            print(f"S3オブジェクト '{s3_key}' の全ての{successful_indexes}件のレポートをElasticsearchにインデックスしたわ。")
-        else:
-            print(f"警告: S3オブジェクト '{s3_key}' の{len(reports_from_s3)}件中{successful_indexes}件のレポートしかElasticsearchにインデックスできなかったわ。")
-            # 部分的な失敗でも、Lambdaは成功とみなすか、エラーとするか、ポリシーによる
-            # 今回はエラーとして再試行を促す
-            raise Exception("一部のレポートのElasticsearchへのインデックスに失敗したわ。")
+        for s3_key in all_json_keys:
+            print(f"S3オブジェクト '{s3_key}' を読み込み中よ。")
+            try:
+                response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+                file_content = response['Body'].read().decode('utf-8')
+                reports_in_file = json.loads(file_content)
+
+                if not isinstance(reports_in_file, list):
+                    print(f"警告: ファイル '{s3_key}' はJSONリスト形式じゃないみたい。スキップするわ。")
+                    continue
                 
-        print("全ての処理が完了したわ。")
+                if not reports_in_file:
+                    print(f"ファイル '{s3_key}' に処理すべきレポートが見つからなかったわ。")
+                    continue
+
+                successful_indexes_in_file = 0
+                for report in reports_in_file:
+                    if index_data_to_elasticsearch(es_client, report):
+                        successful_indexes_in_file += 1
+                
+                total_reports_indexed += successful_indexes_in_file
+                total_files_processed += 1
+                print(f"ファイル '{s3_key}' から {successful_indexes_in_file} 件のレポートをインデックスしたわ。")
+
+            except json.JSONDecodeError as e:
+                print(f"エラー: ファイル '{s3_key}' のJSON解析に失敗したわ: {e}")
+                traceback.print_exc()
+                continue 
+            except Exception as e:
+                print(f"ファイル '{s3_key}' の処理中に予期せぬエラーが発生したわ: {e}")
+                traceback.print_exc()
+                continue 
+
+        print(f"全ての処理が完了したわ。合計 {total_files_processed} 個のファイルから {total_reports_indexed} 件のレポートをElasticsearchにインデックスしたわ。")
+        
         return {
             "statusCode": 200,
-            "body": json.dumps(f"S3オブジェクト '{s3_key}' の過去データインデックスが完了したわ！")
+            "body": json.dumps(f"S3の全過去データインデックスが完了したわ！合計 {total_reports_indexed} 件インデックス済み。")
         }
 
     except Exception as e:
-        print(f"Lambda関数の実行中に致命的なエラーが発生したわ: {e}")
+        print(f"S3からのファイルリストまたは処理中に致命的なエラーが発生したわ: {e}")
         print(traceback.format_exc())
         return {
             "statusCode": 500,
-            "body": json.dumps(f"Lambda関数の実行中にエラーが発生したわ: {str(e)}")
+            "body": json.dumps(f"処理中にエラーが発生したわ: {str(e)}")
         }
