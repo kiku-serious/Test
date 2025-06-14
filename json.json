@@ -1,0 +1,35 @@
+{
+  "Type": "Task",
+  "Resource": "arn:aws:states:::ecs:runTask.sync", /* .sync をつけるとタスクの完了を待つ */
+  "Parameters": {
+    "LaunchType": "FARGATE",
+    "Cluster": "arn:aws:ecs:YOUR_REGION:YOUR_ACCOUNT_ID:cluster/streamlit-fargate-cluster", /* あんたのクラスタARNね */
+    "TaskDefinition": "arn:aws:ecs:YOUR_REGION:YOUR_ACCOUNT_ID:task-definition/historical-indexer-task:1", /* 作ったタスク定義ARNね */
+    "Overrides": {
+      "ContainerOverrides": [
+        {
+          "Name": "s3-to-es-indexer-container", /* Dockerfileで指定したコンテナ名ね */
+          "Environment": [
+            {
+              "Name": "S3_OBJECT_KEY",
+              "Value.$": "$.s3_key" /* Step Functionsの入力からS3キーを受け取る */
+            }
+          ]
+        }
+      ]
+    },
+    "NetworkConfiguration": { /* Fargateタスクのネットワーク設定もここに定義 */
+      "AwsvpcConfiguration": {
+        "Subnets": [
+            "subnet-priv-a", /* プライベートサブネットのIDを2つ以上 */
+            "subnet-priv-b"
+        ],
+        "SecurityGroups": [
+            "sg-historical-indexer-task" /* タスク用のSG ID */
+        ],
+        "AssignPublicIp": "DISABLED" /* プライベートサブネットだから無効 */
+      }
+    }
+  },
+  "End": true
+}
