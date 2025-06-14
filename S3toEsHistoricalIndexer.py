@@ -1,5 +1,4 @@
 import json
-import boto3 # S3は使わないけど、boto3はBedrockで使うので残す可能性あり
 import os
 import traceback
 from elasticsearch import Elasticsearch, ConnectionError
@@ -9,12 +8,7 @@ from elasticsearch import Elasticsearch, ConnectionError
 # 例: export ELASTICSEARCH_HOST="your-onprem-elasticsearch-ip"
 ELASTICSEARCH_HOST = os.environ.get("ELASTICSEARCH_HOST") # Elasticsearchのエンドポイント (必須)
 ELASTICSEARCH_INDEX_NAME = os.environ.get("ELASTICSEARCH_INDEX_NAME") # Elasticsearchのインデックス名 (必須)
-AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1") # Bedrockを使うなら必要
-
-# --- AWSクライアントの初期化 (このスクリプトではS3は使わない) ---
-# S3クライアントは使わないので削除。Bedrockを使う場合は別途Bedrockクライアントが必要になる。
-# 今回のインデクサーはElasticsearchに投入するだけなので、Bedrockは不要。
-# s3_client = boto3.client('s3', region_name=AWS_REGION)
+AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1") # AWS認証情報取得用（boto3用）
 
 # --- Elasticsearchのクライアント取得ヘルパー関数 ---
 def get_elasticsearch_client():
@@ -26,7 +20,7 @@ def get_elasticsearch_client():
         raise ConnectionError(f"Elasticsearchホスト {ELASTICSEARCH_HOST} への接続に失敗したわ！")
     return es_client_instance
 
-# --- Elasticsearchへのインデックス関数（既存コードから流用・調整） ---
+# --- Elasticsearchへのインデックス関数 ---
 def index_data_to_elasticsearch(es_client, report_data: dict):
     if not ELASTICSEARCH_INDEX_NAME:
         raise ValueError("ELASTICSEARCH_INDEX_NAME環境変数が設定されてないわよ！")
@@ -41,7 +35,7 @@ def index_data_to_elasticsearch(es_client, report_data: dict):
             print(f"警告: レポート '{report_data.get('タイトル', 'N/A')}' の '全文要約ベクトル' がないわ。インデックスをスキップするわよ。")
             return False
         
-        # S3から読み込んだJSONの形式がElasticsearchのマッピングに合っていることを前提とする
+        # S3toEsHistoricalIndexer.py で整形された形式をそのまま利用
         doc = {
             "タイトル": report_data.get('タイトル'),
             "訪問日": report_data.get('訪問日'),
@@ -65,8 +59,8 @@ def index_data_to_elasticsearch(es_client, report_data: dict):
         return False
 
 # --- メイン処理関数 ---
-def index_local_data_to_elasticsearch(local_file_path: str):
-    print(f"ローカルファイル '{local_file_path}' のデータをElasticsearchにインデックスするわ。")
+def index_local_directory_to_elasticsearch(local_directory_path: str):
+    print(f"ローカルディレクトリ '{local_directory_path}' 内のデータをElasticsearchにインデックスするわ。")
 
     # 環境変数の必須チェック
     required_envs = ['ELASTICSEARCH_HOST', 'ELASTICSEARCH_INDEX_NAME']
@@ -74,51 +68,73 @@ def index_local_data_to_elasticsearch(local_file_path: str):
         if not os.environ.get(env_var):
             raise ValueError(f"必須環境変数 '{env_var}' が設定されてないわよ！")
 
-    if not os.path.exists(local_file_path):
-        raise FileNotFoundError(f"ファイル '{local_file_path}' が見つからないわよ！")
+    if not os.path.isdir(local_directory_path):
+        raise FileNotFoundError(f"ディレクトリ '{local_directory_path}' が見つからないか、ディレクトリじゃないわよ！")
+
+    es_client = get_elasticsearch_client()
+    total_indexed_files = 0
+    total_indexed_reports = 0
 
     try:
-        # ローカルからJSONファイルを読み込む
-        with open(local_file_path, 'r', encoding='utf-8') as f:
-            reports_from_file = json.load(f)
+        # ディレクトリ内の全てのファイルとフォルダをリスト
+        for filename in os.listdir(local_directory_path):
+            if filename.endswith('.json'): # .jsonで終わるファイルだけを対象にする
+                file_path = os.path.join(local_directory_path, filename)
+                print(f"ファイル '{file_path}' を読み込み中よ。")
 
-        if not reports_from_file:
-            print(f"ファイル '{local_file_path}' に処理すべきレポートが見つからなかったわ。")
-            return None # データがない場合は処理終了
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        reports_from_file = json.load(f)
 
-        es_client = get_elasticsearch_client()
+                    if not isinstance(reports_from_file, list):
+                        print(f"警告: ファイル '{file_path}' はJSONリスト形式じゃないみたい。スキップするわ。")
+                        continue
+                    
+                    if not reports_from_file:
+                        print(f"ファイル '{file_path}' に処理すべきレポートが見つからなかったわ。")
+                        continue
 
-        successful_indexes = 0
-        for report in reports_from_file:
-            if index_data_to_elasticsearch(es_client, report):
-                successful_indexes += 1
-            
-        if successful_indexes == len(reports_from_file):
-            print(f"ファイル '{local_file_path}' の全ての{successful_indexes}件のレポートをElasticsearchにインデックスしたわ。")
+                    successful_indexes_in_file = 0
+                    for report in reports_from_file:
+                        if index_data_to_elasticsearch(es_client, report):
+                            successful_indexes_in_file += 1
+                        
+                    total_indexed_reports += successful_indexes_in_file
+                    total_indexed_files += 1
+                    print(f"ファイル '{file_path}' から {successful_indexes_in_file} 件のレポートをインデックスしたわ。")
+
+                except json.JSONDecodeError as e:
+                    print(f"エラー: ファイル '{file_path}' のJSON解析に失敗したわ: {e}")
+                    traceback.print_exc()
+                    continue # 次のファイルへ
+                except Exception as e:
+                    print(f"ファイル '{file_path}' の処理中に予期せぬエラーが発生したわ: {e}")
+                    traceback.print_exc()
+                    continue # 次のファイルへ
+
+        if total_indexed_files == 0:
+            print("指定されたディレクトリにインデックスすべきJSONファイルが見つからなかったわ。")
         else:
-            print(f"警告: ファイル '{local_file_path}' の{len(reports_from_file)}件中{successful_indexes}件のレポートしかElasticsearchにインデックスできなかったわ。")
-            raise Exception("一部のレポートのElasticsearchへのインデックスに失敗したわ。")
-                
-        print("全ての処理が完了したわ。")
+            print(f"全ての処理が完了したわ。合計 {total_indexed_files} 個のファイルから {total_indexed_reports} 件のレポートをElasticsearchにインデックスしたわ。")
 
     except Exception as e:
-        print(f"処理中に致命的なエラーが発生したわ: {e}")
-        print(traceback.format_exc())
+        print(f"メイン処理中に致命的なエラーが発生したわ: {e}")
+        traceback.print_exc()
         raise # エラー発生時は処理を中断する
 
 # --- スクリプトのエントリポイント ---
 if __name__ == "__main__":
-    # コマンドライン引数からローカルファイルのパスを取得
-    # 例: python S3toEsHistoricalIndexer.py processed_sharepoint_reports/2023-01-01_to_2023-01-31_reports.json
+    # コマンドライン引数からローカルディレクトリのパスを取得
+    # 例: python S3toEsHistoricalIndexer.py processed_sharepoint_reports/
     import sys
     if len(sys.argv) != 2:
-        print("使い方： python S3toEsHistoricalIndexer.py <ローカル_JSONファイルパス>")
+        print("使い方： python S3toEsHistoricalIndexer.py <ローカル_JSONディレクトリパス>")
         sys.exit(1)
     
-    local_json_file_path = sys.argv[1]
+    local_directory_path = sys.argv[1]
     
     try:
-        index_local_data_to_elasticsearch(local_json_file_path)
+        index_local_directory_to_elasticsearch(local_directory_path)
     except Exception as e:
         print(f"Elasticsearchへのインデックス中にエラーが発生したわ: {e}")
         sys.exit(1)
