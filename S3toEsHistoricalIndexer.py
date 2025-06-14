@@ -1,18 +1,20 @@
 import json
-import boto3
+import boto3 # S3は使わないけど、boto3はBedrockで使うので残す可能性あり
 import os
 import traceback
 from elasticsearch import Elasticsearch, ConnectionError
 
 # --- 環境変数の設定 ---
-# これらの環境変数はFargateタスクの定義で設定されるか、タスク起動時に渡される
+# これらの環境変数は、ローカルPCで実行する前に設定すること！
+# 例: export ELASTICSEARCH_HOST="your-onprem-elasticsearch-ip"
 ELASTICSEARCH_HOST = os.environ.get("ELASTICSEARCH_HOST") # Elasticsearchのエンドポイント (必須)
 ELASTICSEARCH_INDEX_NAME = os.environ.get("ELASTICSEARCH_INDEX_NAME") # Elasticsearchのインデックス名 (必須)
-S3_BUCKET_NAME = os.environ.get("BUCKET_NAME") # S3バケット名 (必須)
-AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1") # S3クライアント初期化用リージョン
+AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1") # Bedrockを使うなら必要
 
-# --- AWSクライアントの初期化 ---
-s3_client = boto3.client('s3', region_name=AWS_REGION)
+# --- AWSクライアントの初期化 (このスクリプトではS3は使わない) ---
+# S3クライアントは使わないので削除。Bedrockを使う場合は別途Bedrockクライアントが必要になる。
+# 今回のインデクサーはElasticsearchに投入するだけなので、Bedrockは不要。
+# s3_client = boto3.client('s3', region_name=AWS_REGION)
 
 # --- Elasticsearchのクライアント取得ヘルパー関数 ---
 def get_elasticsearch_client():
@@ -39,7 +41,7 @@ def index_data_to_elasticsearch(es_client, report_data: dict):
             print(f"警告: レポート '{report_data.get('タイトル', 'N/A')}' の '全文要約ベクトル' がないわ。インデックスをスキップするわよ。")
             return False
         
-        # Elasticsearchマッピングに合わせた doc を構築 (KEY_MAPはここでは不要、前のLambdaで適用済み)
+        # S3から読み込んだJSONの形式がElasticsearchのマッピングに合っていることを前提とする
         doc = {
             "タイトル": report_data.get('タイトル'),
             "訪問日": report_data.get('訪問日'),
@@ -62,68 +64,61 @@ def index_data_to_elasticsearch(es_client, report_data: dict):
         print(f"Elasticsearchへのインデックス中にエラーが発生したわ: {e}", exc_info=True)
         return False
 
-# --- メイン処理関数 (Fargateタスクのエントリポイントになる) ---
-def process_s3_object_and_index(s3_key: str):
-    print(f"S3からオブジェクト '{s3_key}' を読み込み中よ。")
+# --- メイン処理関数 ---
+def index_local_data_to_elasticsearch(local_file_path: str):
+    print(f"ローカルファイル '{local_file_path}' のデータをElasticsearchにインデックスするわ。")
 
     # 環境変数の必須チェック
-    required_envs = ['ELASTICSEARCH_HOST', 'ELASTICSEARCH_INDEX_NAME', 'S3_BUCKET_NAME']
+    required_envs = ['ELASTICSEARCH_HOST', 'ELASTICSEARCH_INDEX_NAME']
     for env_var in required_envs:
         if not os.environ.get(env_var):
             raise ValueError(f"必須環境変数 '{env_var}' が設定されてないわよ！")
 
+    if not os.path.exists(local_file_path):
+        raise FileNotFoundError(f"ファイル '{local_file_path}' が見つからないわよ！")
+
     try:
-        # S3からJSONファイルを読み込む
-        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
-        file_content = response['Body'].read().decode('utf-8')
-        reports_from_s3 = json.loads(file_content)
+        # ローカルからJSONファイルを読み込む
+        with open(local_file_path, 'r', encoding='utf-8') as f:
+            reports_from_file = json.load(f)
 
-        if not reports_from_s3:
-            print(f"S3オブジェクト '{s3_key}' に処理すべきレポートが見つからなかったわ。")
-            return {
-                "status": "SUCCESS",
-                "message": "処理すべきレポートがなかったわ。"
-            }
+        if not reports_from_file:
+            print(f"ファイル '{local_file_path}' に処理すべきレポートが見つからなかったわ。")
+            return None # データがない場合は処理終了
 
-        # Elasticsearchクライアントを取得
         es_client = get_elasticsearch_client()
 
-        # Elasticsearchにインデックス
         successful_indexes = 0
-        for report in reports_from_s3:
+        for report in reports_from_file:
             if index_data_to_elasticsearch(es_client, report):
                 successful_indexes += 1
             
-        if successful_indexes == len(reports_from_s3):
-            print(f"S3オブジェクト '{s3_key}' の全ての{successful_indexes}件のレポートをElasticsearchにインデックスしたわ。")
+        if successful_indexes == len(reports_from_file):
+            print(f"ファイル '{local_file_path}' の全ての{successful_indexes}件のレポートをElasticsearchにインデックスしたわ。")
         else:
-            print(f"警告: S3オブジェクト '{s3_key}' の{len(reports_from_s3)}件中{successful_indexes}件のレポートしかElasticsearchにインデックスできなかったわ。")
+            print(f"警告: ファイル '{local_file_path}' の{len(reports_from_file)}件中{successful_indexes}件のレポートしかElasticsearchにインデックスできなかったわ。")
             raise Exception("一部のレポートのElasticsearchへのインデックスに失敗したわ。")
                 
         print("全ての処理が完了したわ。")
-        return {
-            "status": "SUCCESS",
-            "message": f"S3オブジェクト '{s3_key}' の過去データインデックスが完了したわ！"
-        }
 
     except Exception as e:
-        print(f"Fargateタスクの実行中に致命的なエラーが発生したわ: {e}")
+        print(f"処理中に致命的なエラーが発生したわ: {e}")
         print(traceback.format_exc())
-        raise # Fargateタスクは失敗したらエラーを投げる
+        raise # エラー発生時は処理を中断する
 
 # --- スクリプトのエントリポイント ---
 if __name__ == "__main__":
-    # このスクリプトはStep FunctionsからFargateタスクとして起動されることを想定
-    # Step Functionsは 'taskOverrides' で環境変数やコマンド引数を渡せる
-    # ここでは、環境変数 'S3_OBJECT_KEY' から処理対象のS3キーを取得する
-    s3_object_key_from_env = os.environ.get('S3_OBJECT_KEY')
+    # コマンドライン引数からローカルファイルのパスを取得
+    # 例: python S3toEsHistoricalIndexer.py processed_sharepoint_reports/2023-01-01_to_2023-01-31_reports.json
+    import sys
+    if len(sys.argv) != 2:
+        print("使い方： python S3toEsHistoricalIndexer.py <ローカル_JSONファイルパス>")
+        sys.exit(1)
     
-    if not s3_object_key_from_env:
-        print("エラー: 環境変数 'S3_OBJECT_KEY' が設定されてないわよ！")
-        exit(1) # エラー終了
-
+    local_json_file_path = sys.argv[1]
+    
     try:
-        process_s3_object_and_index(s3_object_key_from_env)
+        index_local_data_to_elasticsearch(local_json_file_path)
     except Exception as e:
-        print(f"Fargateタスクのメイン処理中にエラーが発生したわ: {e}")
-        exit(1) # エラー終了
+        print(f"Elasticsearchへのインデックス中にエラーが発生したわ: {e}")
+        sys.exit(1)

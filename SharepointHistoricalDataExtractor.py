@@ -4,20 +4,25 @@ from bs4 import BeautifulSoup
 import re
 import datetime
 import json
-import urllib3
-import boto3
 import os
-import io
 import traceback
+import urllib3 # 追加: urllib3をインポート
 
 # --- 環境変数の設定 ---
-# これらの環境変数はFargateタスクの定義で設定されるか、タスク起動時に渡される
+# これらの環境変数は、ローカルPCで実行する前に設定すること！
+# 例: export DOMAIN_PASSWORD="your_password"
 DOMAIN_PASSWORD = os.environ.get('DOMAIN_PASSWORD') # SharePointアクセス用パスワード (必須)
 SITE_URL = os.environ.get('SITE_URL') # SharePointサイトのURL (必須)
 DOMAIN = os.environ.get('DOMAIN') # SharePointドメイン (必須)
 LOGINNAME = os.environ.get('LOGINNAME') # SharePointログインユーザー名 (必須)
 LOGINPASSWORD = os.environ.get('LOGINPASSWORD') # SharePointログインパスワード（DOMAIN_PASSWORDと同じでも可） (必須)
 
+# Bedrockモデル情報 (埋め込み生成に使う)
+BEDROCK_SUMMARY_MODEL_ID = os.environ.get("BEDROCK_SUMMARY_MODEL_ID", "anthropic.claude-instant-v1") # 要約用BedrockモデルID
+BEDROCK_EMBEDDING_MODEL_ID = os.environ.get("BEDROCK_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v1") # 埋め込み用BedrockモデルID
+AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1") # Bedrockのリージョン
+
+# プロキシ情報（必要なら）
 HTTP_PROXY = os.environ.get('HTTP_PROXY')
 HTTPS_PROXY = os.environ.get('HTTPS_PROXY')
 proxies = {}
@@ -28,24 +33,18 @@ if HTTPS_PROXY:
 if not proxies:
     proxies = None
 
-BEDROCK_SUMMARY_MODEL_ID = os.environ.get("BEDROCK_SUMMARY_MODEL_ID", "anthropic.claude-instant-v1")
-BEDROCK_EMBEDDING_MODEL_ID = os.environ.get("BEDROCK_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v1")
-AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
-
-BUCKET_NAME = os.environ.get('BUCKET_NAME') # S3バケット名 (必須)
-ELASTICSEARCH_HOST = os.environ.get("ELASTICSEARCH_HOST") # Elasticsearchのエンドポイント (必須、今回は使わないが環境変数として残す)
-ELASTICSEARCH_INDEX_NAME = os.environ.get("ELASTICSEARCH_INDEX_NAME") # Elasticsearchのインデックス名 (必須、今回は使わないが環境変数として残す)
-
-# 埋め込みベクトルの次元数 (このタスクで生成する)
+# 埋め込みベクトルの次元数
 EMBEDDING_DIMS = 1536 
 
-# --- AWSクライアントの初期化 ---
-s3_client = boto3.client('s3', region_name=AWS_REGION)
+# SSL検証を無効にする設定（requests.get(verify=False)を使う場合）
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- AWSクライアントの初期化 (ローカル実行なのでBedrockのみ) ---
+# S3クライアントはS3への直接保存がなくなったので不要
 bedrock_runtime = boto3.client(
     service_name = "bedrock-runtime",
     region_name = AWS_REGION
 )
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- SharePointのフィールド名マッピング ---
 FIELD_TITLE = 'Title'
@@ -81,10 +80,7 @@ KEY_MAP = {
     "summary_vector": '全文要約ベクトル',
 }
 
-# --- ヘルパー関数 (既存コードから流用・一部調整) ---
-
-# Elasticsearchクライアントはここでは不要なので削除
-# def get_elasticsearch_client(): ...
+# --- ヘルパー関数 (既存コードから流用・調整) ---
 
 def summarize_text_with_bedrock(text):
     if not BEDROCK_SUMMARY_MODEL_ID:
@@ -124,19 +120,6 @@ def get_embedding_from_bedrock(text: str) -> list[float] | None:
     except Exception as e:
         print(f"Bedrockでの埋め込み生成中にエラーが発生したわ: {e}", exc_info=True)
         return None
-
-def store_json_to_s3(data, filename):
-    if not BUCKET_NAME:
-        print("警告: BUCKET_NAME環境変数が設定されてないわ！S3への保存をスキップするわよ。")
-        return False
-    try:
-        json_data = json.dumps(data, ensure_ascii=False, indent=2)
-        s3_client.put_object(Bucket=BUCKET_NAME, Key=filename, Body=json_data.encode('utf-8'), ContentType='application/json')
-        print(f"S3にファイル'{filename}'を保存したわ。")
-        return True
-    except Exception as e:
-        print(f"S3への保存中にエラーが発生したわ: {e}", exc_info=True)
-        return False
 
 def parse_visit_date(date_str: str) -> str | None:
     if not date_str:
@@ -190,16 +173,12 @@ def extract_sections(body_text_html):
         print("警告: 所感セクションを抽出できませんでした。")
     return sections
 
-# index_data_to_elasticsearch はこのLambdaでは直接使わないため削除
-# def index_data_to_elasticsearch(...): ...
-
-# --- メイン処理関数 (Fargateタスクのエントリポイントになる) ---
-# この関数がStep Functionsから呼び出される
-def process_sharepoint_historical_data(start_date_str: str, end_date_str: str):
-    print("Lambda関数が実行されたわ。") # FargateタスクだけどLambda関数って表示されても気にしない
+# --- メイン処理関数 ---
+def download_and_process_sharepoint_data(start_date_str: str, end_date_str: str, output_dir: str = "processed_sharepoint_reports"):
+    print("SharePointデータダウンロード処理を開始するわ。")
     
     # 環境変数の必須チェック
-    required_envs = ['DOMAIN_PASSWORD', 'SITE_URL', 'DOMAIN', 'LOGINNAME', 'LOGINPASSWORD', 'BUCKET_NAME']
+    required_envs = ['DOMAIN_PASSWORD', 'SITE_URL', 'DOMAIN', 'LOGINNAME', 'LOGINPASSWORD', 'AWS_REGION', 'BEDROCK_EMBEDDING_MODEL_ID', 'BEDROCK_SUMMARY_MODEL_ID']
     for env_var in required_envs:
         if not os.environ.get(env_var):
             raise ValueError(f"必須環境変数 '{env_var}' が設定されてないわよ！")
@@ -207,11 +186,7 @@ def process_sharepoint_historical_data(start_date_str: str, end_date_str: str):
     current_password = LOGINPASSWORD
 
     try:
-        # イベントから開始日と終了日を取得
-        # Step Functionsから 'start_date' と 'end_date' が渡されることを想定
-        if not start_date_str or not end_date_str:
-            raise ValueError("開始日 (start_date) と終了日 (end_date) を環境変数またはコマンド引数で指定しなさい！") # イベントからではなく環境変数から取得
-
+        # 日付文字列をパース
         start_dt_utc = datetime.datetime.strptime(start_date_str, '%Y-%m-%d').replace(tzinfo=datetime.timezone.utc)
         end_dt_utc = datetime.datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59, tzinfo=datetime.timezone.utc)
 
@@ -219,11 +194,11 @@ def process_sharepoint_historical_data(start_date_str: str, end_date_str: str):
 
     except Exception as e:
         print(f"日付パース中にエラーが発生したわ: {e}", exc_info=True)
-        raise # エラー発生時はタスクを失敗させる
+        raise ValueError(f"不正な日付形式よ！YYYY-MM-DD形式でstart_dateとend_dateを指定しなさい: {str(e)}")
 
     all_sharepoint_items = []
+    
     # SharePointクエリパラメータ（mrtApprovedDate をフィルター）
-    # $selectと$expandはLambdaから流用し、必要なフィールドを明示
     query_params_base = {
         "$filter": f"mrtApprovedDate ge datetime'{start_dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}' and mrtApprovedDate le datetime'{end_dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}'",
         "$select": f"{FIELD_TITLE},{FIELD_ID},{FIELD_BODY},{FIELD_APPROVED_DATE},{FIELD_FILE_REF},{FIELD_CUSTOMER_PARTICIPANT},{FIELD_MURATA_PARTICIPANT},{FIELD_SUMMARY_SP},Author/Id",
@@ -239,16 +214,16 @@ def process_sharepoint_historical_data(start_date_str: str, end_date_str: str):
             auth_info = HttpNtlmAuth(f"{DOMAIN}\\{LOGINNAME}", current_password)
             try:
                 response = requests.get(next_link, auth=auth_info, headers={'Accept': 'application/json'}, proxies=proxies, verify=False, timeout=60)
+                
                 if response.status_code == 200:
                     sharepoint_response = response
                     print("SharePointアクセス成功。")
                     break
                 elif response.status_code == 401:
-                    print(f"SharePoint認証失敗 (401 Unauthorized)。パスワード変更を試行はしないわ。")
-                    # これは手動実行なので、パスワード変更ロジックは不要。正しいパスワードが設定されている前提。
-                    if count < 2: # リトライ回数内なら継続
+                    print(f"SharePoint認証失敗 (401 Unauthorized)。パスワード変更ロジックは手動実行では適用しないわ。")
+                    if count < 2:
                         continue
-                    else: # リトライオーバーなら例外
+                    else:
                          raise Exception("SharePoint認証に繰り返し失敗しました。正しいパスワードを確認しなさい！")
                 else:
                     print(f"SharePointアクセスエラー: ステータスコード {response.status_code}, 理由: {response.reason}")
@@ -270,14 +245,10 @@ def process_sharepoint_historical_data(start_date_str: str, end_date_str: str):
 
     if not all_sharepoint_items:
         print(f"指定された期間 ({start_date_str} - {end_date_str}) で新しいデータが見つかりませんでした。")
-        return {
-            "status": "SUCCESS", # Fargateタスクからの成功応答
-            "message": "SharePointから新しいデータが見つかりませんでした。",
-            "s3_output_key": None
-        }
+        return None # データがない場合はNoneを返す
 
     # データの構造化と処理
-    reports_to_process = []
+    reports_to_save = []
 
     for sp_raw_item in all_sharepoint_items:
         try:
@@ -330,48 +301,50 @@ def process_sharepoint_historical_data(start_date_str: str, end_date_str: str):
                 print(f"警告: レポート '{processed_item[KEY_MAP['Title']]}' の全文要約ベクトル生成に失敗したため、このレポートはスキップするわ。")
                 continue
             
-            reports_to_process.append(processed_item)
+            reports_to_save.append(processed_item)
 
         except Exception as e:
             print(f"SharePointアイテム '{sp_raw_item.get('Title', 'N/A')}' の処理中にエラーが発生したわ: {e}")
             print(traceback.format_exc())
             continue
 
-    if not reports_to_process:
+    if not reports_to_save:
         print(f"指定された期間 ({start_date_str} - {end_date_str}) で処理すべきレポートがなかったわ。")
-        return {
-            "status": "SUCCESS",
-            "message": "SharePointから新しいデータが見つかりませんでした。",
-            "s3_output_key": None
-        }
+        return None
 
-    # S3に全てのレポートをリスト形式の単一JSONファイルとして保存するわ
+    # ローカルの出力ディレクトリを作成
+    os.makedirs(output_dir, exist_ok=True)
     # ファイル名に日付範囲を含めて分かりやすくする
-    s3_output_filename = f"processed_historical_reports/{start_dt_utc.strftime('%Y-%m-%d')}_to_{end_dt_utc.strftime('%Y-%m-%d')}_reports.json"
-    if not store_json_to_s3(reports_to_process, s3_output_filename):
-        print("S3へのレポートリストの保存に失敗したわ。")
-        raise Exception("S3へのレポートリストの保存に失敗したわ。") # S3保存失敗はエラーにする
-            
-    print("全ての処理が完了したわ。")
-    return {
-        "status": "SUCCESS",
-        "message": f"SharePointから過去レポートの取得、処理、S3への保存が完了したわ！S3キー: {s3_output_filename}",
-        "s3_output_key": s3_output_filename # 次のStep Functionsのステップに渡す
-    }
+    local_output_filename = os.path.join(output_dir, f"{start_dt_utc.strftime('%Y-%m-%d')}_to_{end_dt_utc.strftime('%Y-%m-%d')}_reports.json")
+    
+    try:
+        with open(local_output_filename, 'w', encoding='utf-8') as f:
+            json.dump(reports_to_save, f, ensure_ascii=False, indent=2)
+        print(f"全ての処理済みレポートをローカルファイル'{local_output_filename}'に保存したわ！")
+        return local_output_filename # 保存されたファイルパスを返す
+    except Exception as e:
+        print(f"ローカルファイルへの保存中にエラーが発生したわ: {e}")
+        raise # エラー発生時は処理を中断する
 
 # --- スクリプトのエントリポイント ---
 if __name__ == "__main__":
-    # このスクリプトはStep FunctionsからFargateタスクとして起動されることを想定
-    # Step Functionsは 'taskOverrides' で環境変数 'START_DATE' と 'END_DATE' を渡せる
-    start_date_from_env = os.environ.get('START_DATE')
-    end_date_from_env = os.environ.get('END_DATE')
+    # コマンドライン引数から開始日と終了日を取得
+    # 例: python SharepointHistoricalDataDownloader.py 2023-01-01 2023-01-31
+    import sys
+    if len(sys.argv) != 3:
+        print("使い方： python SharepointHistoricalDataDownloader.py <開始日 YYYY-MM-DD> <終了日 YYYY-MM-DD>")
+        sys.exit(1)
     
-    if not start_date_from_env or not end_date_from_env:
-        print("エラー: 環境変数 'START_DATE' または 'END_DATE' が設定されてないわよ！")
-        exit(1) # エラー終了
-
+    start_date = sys.argv[1]
+    end_date = sys.argv[2]
+    
     try:
-        process_sharepoint_historical_data(start_date_from_env, end_date_from_env)
+        downloaded_file_path = download_and_process_sharepoint_data(start_date, end_date)
+        if downloaded_file_path:
+            print(f"S3にアップロードするJSONファイルのパス: {downloaded_file_path}")
+            print(f"このファイルを '{os.environ.get('BUCKET_NAME')}/processed_historical_reports/' に手動でアップロードしなさい！")
+        else:
+            print("処理されたデータがなかったので、ファイルは保存されなかったわ。")
     except Exception as e:
-        print(f"Fargateタスクのメイン処理中にエラーが発生したわ: {e}")
-        exit(1) # エラー終了
+        print(f"処理中にエラーが発生したわ: {e}")
+        sys.exit(1)
