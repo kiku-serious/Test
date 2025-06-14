@@ -6,11 +6,11 @@ import datetime
 import json
 import os
 import traceback
-import urllib3 # 追加: urllib3をインポート
+import urllib3
+import boto3
 
 # --- 環境変数の設定 ---
-# これらの環境変数は、ローカルPCで実行する前に設定すること！
-# 例: export DOMAIN_PASSWORD="your_password"
+# これらの環境変数はAWS Batchジョブ定義で設定される
 DOMAIN_PASSWORD = os.environ.get('DOMAIN_PASSWORD') # SharePointアクセス用パスワード (必須)
 SITE_URL = os.environ.get('SITE_URL') # SharePointサイトのURL (必須)
 DOMAIN = os.environ.get('DOMAIN') # SharePointドメイン (必須)
@@ -22,7 +22,7 @@ BEDROCK_SUMMARY_MODEL_ID = os.environ.get("BEDROCK_SUMMARY_MODEL_ID", "anthropic
 BEDROCK_EMBEDDING_MODEL_ID = os.environ.get("BEDROCK_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v1") # 埋め込み用BedrockモデルID
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1") # Bedrockのリージョン
 
-# プロキシ情報（必要なら）
+# プロキシ情報（必要なら、AWS Batch環境で設定）
 HTTP_PROXY = os.environ.get('HTTP_PROXY')
 HTTPS_PROXY = os.environ.get('HTTPS_PROXY')
 proxies = {}
@@ -33,14 +33,18 @@ if HTTPS_PROXY:
 if not proxies:
     proxies = None
 
+# S3バケット情報
+BUCKET_NAME = os.environ.get('BUCKET_NAME') # S3バケット名 (必須)
+S3_PREFIX = os.environ.get('S3_PREFIX', 'processed_historical_reports/') # S3に保存する際のプレフィックス
+
 # 埋め込みベクトルの次元数
 EMBEDDING_DIMS = 1536 
 
 # SSL検証を無効にする設定（requests.get(verify=False)を使う場合）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- AWSクライアントの初期化 (ローカル実行なのでBedrockのみ) ---
-# S3クライアントはS3への直接保存がなくなったので不要
+# --- AWSクライアントの初期化 ---
+s3_client = boto3.client('s3', region_name=AWS_REGION)
 bedrock_runtime = boto3.client(
     service_name = "bedrock-runtime",
     region_name = AWS_REGION
@@ -49,14 +53,13 @@ bedrock_runtime = boto3.client(
 # --- SharePointのフィールド名マッピング ---
 FIELD_TITLE = 'Title'
 FIELD_ID = 'ID'
-FIELD_BODY = 'mrtBody' # SharePointのHTML本文フィールド名
-FIELD_APPROVED_DATE = 'mrtApprovedDate' # SharePointの承認日フィールド名
-FIELD_FILE_REF = 'FileLeafRef' # SharePointのファイル名フィールド名
+FIELD_BODY = 'mrtBody'
+FIELD_APPROVED_DATE = 'mrtApprovedDate'
+FIELD_FILE_REF = 'FileLeafRef'
 FIELD_CUSTOMER_PARTICIPANT = 'mrtCustomerParticipant'
 FIELD_MURATA_PARTICIPANT = 'mrtMurataParticipant'
-FIELD_SUMMARY_SP = 'mrtSummary' # SharePointの既存概要フィールド名
+FIELD_SUMMARY_SP = 'mrtSummary'
 
-# 出張報告書のセクションラベル（HTMLから抽出するためのキーワード）
 TRIP_REP_DATE = '訪問日'
 TRIP_REP_CUSTOMER = "得意先参加者"
 TRIP_REP_MURATA = "村田同行者"
@@ -64,7 +67,6 @@ TRIP_REP_SUMMARY = "概要"
 TRIP_REP_DETAIL = "詳細"
 TRIP_REP_COMMENT = "所感"
 
-# 最終的な出力形式のキー名マッピング
 KEY_MAP = {
     "Title": 'タイトル',
     "TripRep_Date": '訪問日',
@@ -80,7 +82,7 @@ KEY_MAP = {
     "summary_vector": '全文要約ベクトル',
 }
 
-# --- ヘルパー関数 (既存コードから流用・調整) ---
+# --- ヘルパー関数 ---
 
 def summarize_text_with_bedrock(text):
     if not BEDROCK_SUMMARY_MODEL_ID:
@@ -173,12 +175,12 @@ def extract_sections(body_text_html):
         print("警告: 所感セクションを抽出できませんでした。")
     return sections
 
-# --- メイン処理関数 ---
-def download_and_process_sharepoint_data(start_date_str: str, end_date_str: str, output_dir: str = "processed_sharepoint_reports"):
+# --- メイン処理関数 (AWS Batchジョブのエントリポイントになる) ---
+def download_and_process_sharepoint_data(start_date_str: str, end_date_str: str):
     print("SharePointデータダウンロード処理を開始するわ。")
     
     # 環境変数の必須チェック
-    required_envs = ['DOMAIN_PASSWORD', 'SITE_URL', 'DOMAIN', 'LOGINNAME', 'LOGINPASSWORD', 'AWS_REGION', 'BEDROCK_EMBEDDING_MODEL_ID', 'BEDROCK_SUMMARY_MODEL_ID']
+    required_envs = ['DOMAIN_PASSWORD', 'SITE_URL', 'DOMAIN', 'LOGINNAME', 'LOGINPASSWORD', 'BUCKET_NAME', 'AWS_REGION', 'BEDROCK_EMBEDDING_MODEL_ID', 'BEDROCK_SUMMARY_MODEL_ID']
     for env_var in required_envs:
         if not os.environ.get(env_var):
             raise ValueError(f"必須環境変数 '{env_var}' が設定されてないわよ！")
@@ -186,7 +188,6 @@ def download_and_process_sharepoint_data(start_date_str: str, end_date_str: str,
     current_password = LOGINPASSWORD
 
     try:
-        # 日付文字列をパース
         start_dt_utc = datetime.datetime.strptime(start_date_str, '%Y-%m-%d').replace(tzinfo=datetime.timezone.utc)
         end_dt_utc = datetime.datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59, tzinfo=datetime.timezone.utc)
 
@@ -198,7 +199,6 @@ def download_and_process_sharepoint_data(start_date_str: str, end_date_str: str,
 
     all_sharepoint_items = []
     
-    # SharePointクエリパラメータ（mrtApprovedDate をフィルター）
     query_params_base = {
         "$filter": f"mrtApprovedDate ge datetime'{start_dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}' and mrtApprovedDate le datetime'{end_dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}'",
         "$select": f"{FIELD_TITLE},{FIELD_ID},{FIELD_BODY},{FIELD_APPROVED_DATE},{FIELD_FILE_REF},{FIELD_CUSTOMER_PARTICIPANT},{FIELD_MURATA_PARTICIPANT},{FIELD_SUMMARY_SP},Author/Id",
@@ -241,46 +241,39 @@ def download_and_process_sharepoint_data(start_date_str: str, end_date_str: str,
 
         json_data = sharepoint_response.json()
         all_sharepoint_items.extend(json_data.get('value', []))
-        next_link = json_data.get('odata.nextLink', json_data.get('__next')) # ページネーションリンク
+        next_link = json_data.get('odata.nextLink', json_data.get('__next'))
 
     if not all_sharepoint_items:
         print(f"指定された期間 ({start_date_str} - {end_date_str}) で新しいデータが見つかりませんでした。")
         return None # データがない場合はNoneを返す
 
-    # データの構造化と処理
-    reports_to_save = []
+    reports_to_upload = []
 
     for sp_raw_item in all_sharepoint_items:
         try:
             processed_item = {}
 
-            # 1. 基本フィールドの抽出
             processed_item[KEY_MAP["Title"]] = sp_raw_item.get(FIELD_TITLE, 'N/A')
             processed_item[KEY_MAP["source_sharepoint_file_id"]] = str(sp_raw_item.get(FIELD_ID, 'N/A'))
             processed_item[KEY_MAP["TripRep_Date"]] = parse_visit_date(sp_raw_item.get(FIELD_APPROVED_DATE, ''))
             processed_item[KEY_MAP["URL"]] = f"{SITE_URL}/Lists/For%20Global/DispForm.aspx?ID={processed_item[KEY_MAP['source_sharepoint_file_id']]}"
             processed_item[KEY_MAP["source_sharepoint_filename"]] = sp_raw_item.get(FIELD_FILE_REF, f"SharePoint_Item_{processed_item[KEY_MAP['source_sharepoint_file_id']]}.txt")
 
-            # SharePointの本文HTMLフィールド mrtBody からテキストを抽出 (これが「詳細」の全文)
             extracted_body_text = extract_text_from_html(sp_raw_item.get(FIELD_BODY, ''))
             processed_item[KEY_MAP["TripRep_Detail"]] = extracted_body_text
 
-            # 2. 特定セクションの抽出 (概要)
             sections = extract_sections(sp_raw_item.get(FIELD_BODY, ''))
             processed_item[KEY_MAP["TripRep_Summary"]] = sections.get(TRIP_REP_SUMMARY, 'N/A')
             
-            # 得意先参加者、村田同行者はSharePointのフィールドから直接取得
             processed_item[KEY_MAP["TripRep_Customer"]] = sp_raw_item.get(FIELD_CUSTOMER_PARTICIPANT, 'N/A')
             processed_item[KEY_MAP["TripRep_Murata"]] = sp_raw_item.get(FIELD_MURATA_PARTICIPANT, 'N/A')
             
-            # 3. 「詳細要約」をBedrockで生成
             summary_text = summarize_text_with_bedrock(processed_item[KEY_MAP["TripRep_Detail"]])
             if not summary_text:
                 print(f"警告: レポート '{processed_item[KEY_MAP['Title']]}' の詳細要約生成に失敗したためスキップするわ。")
                 continue
             processed_item[KEY_MAP["TripRep_DetailSummary"]] = summary_text
 
-            # 4. 埋め込みベクトル生成 (2種類)
             full_embedding_text = (
                 f"タイトル: {processed_item[KEY_MAP['Title']]}\n"
                 f"概要: {processed_item[KEY_MAP['TripRep_Summary']]}\n"
@@ -301,50 +294,58 @@ def download_and_process_sharepoint_data(start_date_str: str, end_date_str: str,
                 print(f"警告: レポート '{processed_item[KEY_MAP['Title']]}' の全文要約ベクトル生成に失敗したため、このレポートはスキップするわ。")
                 continue
             
-            reports_to_save.append(processed_item)
+            reports_to_upload.append(processed_item)
 
         except Exception as e:
             print(f"SharePointアイテム '{sp_raw_item.get('Title', 'N/A')}' の処理中にエラーが発生したわ: {e}")
             print(traceback.format_exc())
             continue
 
-    if not reports_to_save:
+    if not reports_to_upload:
         print(f"指定された期間 ({start_date_str} - {end_date_str}) で処理すべきレポートがなかったわ。")
         return None
 
-    # ローカルの出力ディレクトリを作成
-    os.makedirs(output_dir, exist_ok=True)
-    # ファイル名に日付範囲を含めて分かりやすくする
-    local_output_filename = os.path.join(output_dir, f"{start_dt_utc.strftime('%Y-%m-%d')}_to_{end_dt_utc.strftime('%Y-%m-%d')}_reports.json")
+    # S3に全てのレポートをリスト形式の単一JSONファイルとして保存するわ
+    # S3パスは環境変数 S3_PREFIX を使用
+    s3_output_filename = f"{S3_PREFIX}{start_dt_utc.strftime('%Y-%m-%d')}_to_{end_dt_utc.strftime('%Y-%m-%d')}_reports.json"
     
-    try:
-        with open(local_output_filename, 'w', encoding='utf-8') as f:
-            json.dump(reports_to_save, f, ensure_ascii=False, indent=2)
-        print(f"全ての処理済みレポートをローカルファイル'{local_output_filename}'に保存したわ！")
-        return local_output_filename # 保存されたファイルパスを返す
-    except Exception as e:
-        print(f"ローカルファイルへの保存中にエラーが発生したわ: {e}")
-        raise # エラー発生時は処理を中断する
+    if not os.environ.get('BUCKET_NAME'): # S3バケット名が設定されてないと保存できない
+        print("エラー: S3バケット名 (BUCKET_NAME) が設定されてないため、S3への保存をスキップするわ。")
+        raise ValueError("BUCKET_NAME環境変数が設定されてないわよ！")
 
-# --- スクリプトのエントリポイント ---
+    if not store_json_to_s3(reports_to_upload, s3_output_filename):
+        print("S3へのレポートリストの保存に失敗したわ。")
+        raise Exception("S3へのレポートリストの保存に失敗したわ。") # S3保存失敗はエラーにする
+            
+    print("全ての処理が完了したわ。")
+    return {
+        "status": "SUCCESS",
+        "message": f"SharePointから過去レポートの取得、処理、S3への保存が完了したわ！S3キー: {s3_output_filename}",
+        "s3_output_key": s3_output_filename # 次のLambda関数に渡す情報
+    }
+
+# --- スクリプトのエントリポイント (AWS Batchジョブとして実行) ---
 if __name__ == "__main__":
-    # コマンドライン引数から開始日と終了日を取得
-    # 例: python SharepointHistoricalDataDownloader.py 2023-01-01 2023-01-31
-    import sys
-    if len(sys.argv) != 3:
-        print("使い方： python SharepointHistoricalDataDownloader.py <開始日 YYYY-MM-DD> <終了日 YYYY-MM-DD>")
-        sys.exit(1)
+    # AWS Batchは環境変数で引数を渡す
+    start_date_from_env = os.environ.get('START_DATE')
+    end_date_from_env = os.environ.get('END_DATE')
     
-    start_date = sys.argv[1]
-    end_date = sys.argv[2]
+    if not start_date_from_env or not end_date_from_env:
+        print("エラー: 環境変数 'START_DATE' または 'END_DATE' が設定されてないわよ！")
+        exit(1)
     
     try:
-        downloaded_file_path = download_and_process_sharepoint_data(start_date, end_date)
-        if downloaded_file_path:
-            print(f"S3にアップロードするJSONファイルのパス: {downloaded_file_path}")
-            print(f"このファイルを '{os.environ.get('BUCKET_NAME')}/processed_historical_reports/' に手動でアップロードしなさい！")
+        result = download_and_process_sharepoint_data(start_date_from_env, end_date_from_env)
+        # AWS Batchジョブが成功した場合は、このスクリプトは0で終了
+        # エラーの場合は、raiseでExceptionを投げて非0で終了
+        if result and result.get("status") == "SUCCESS":
+            print(f"ジョブ成功: {result.get('message')}")
+            # Step Functionsと組み合わせる場合、結果をJSONで出力すると次のステップに渡せる
+            print(json.dumps({"s3_output_key": result.get("s3_output_key")}))
+            exit(0)
         else:
-            print("処理されたデータがなかったので、ファイルは保存されなかったわ。")
+            print(f"ジョブ失敗（データなしまたは警告）: {result.get('message')}")
+            exit(1)
     except Exception as e:
-        print(f"処理中にエラーが発生したわ: {e}")
-        sys.exit(1)
+        print(f"処理中に致命的なエラーが発生し、ジョブが失敗したわ: {e}")
+        exit(1)

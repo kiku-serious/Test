@@ -2,13 +2,17 @@ import json
 import os
 import traceback
 from elasticsearch import Elasticsearch, ConnectionError
+import boto3
 
 # --- 環境変数の設定 ---
-# これらの環境変数は、ローカルPCで実行する前に設定すること！
-# 例: export ELASTICSEARCH_HOST="your-onprem-elasticsearch-ip"
+# これらの環境変数はLambdaの環境変数として設定される
 ELASTICSEARCH_HOST = os.environ.get("ELASTICSEARCH_HOST") # Elasticsearchのエンドポイント (必須)
 ELASTICSEARCH_INDEX_NAME = os.environ.get("ELASTICSEARCH_INDEX_NAME") # Elasticsearchのインデックス名 (必須)
-AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1") # AWS認証情報取得用（boto3用）
+S3_BUCKET_NAME = os.environ.get("BUCKET_NAME") # S3バケット名 (必須)
+AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1") # S3クライアント初期化用リージョン
+
+# --- AWSクライアントの初期化 ---
+s3_client = boto3.client('s3', region_name=AWS_REGION)
 
 # --- Elasticsearchのクライアント取得ヘルパー関数 ---
 def get_elasticsearch_client():
@@ -35,7 +39,6 @@ def index_data_to_elasticsearch(es_client, report_data: dict):
             print(f"警告: レポート '{report_data.get('タイトル', 'N/A')}' の '全文要約ベクトル' がないわ。インデックスをスキップするわよ。")
             return False
         
-        # S3toEsHistoricalIndexer.py で整形された形式をそのまま利用
         doc = {
             "タイトル": report_data.get('タイトル'),
             "訪問日": report_data.get('訪問日'),
@@ -58,83 +61,68 @@ def index_data_to_elasticsearch(es_client, report_data: dict):
         print(f"Elasticsearchへのインデックス中にエラーが発生したわ: {e}", exc_info=True)
         return False
 
-# --- メイン処理関数 ---
-def index_local_directory_to_elasticsearch(local_directory_path: str):
-    print(f"ローカルディレクトリ '{local_directory_path}' 内のデータをElasticsearchにインデックスするわ。")
-
+# --- メインのLambdaハンドラー関数 ---
+def lambda_handler(event, context):
+    print("Lambda関数が実行されたわ。")
+    
     # 環境変数の必須チェック
-    required_envs = ['ELASTICSEARCH_HOST', 'ELASTICSEARCH_INDEX_NAME']
+    required_envs = ['ELASTICSEARCH_HOST', 'ELASTICSEARCH_INDEX_NAME', 'S3_BUCKET_NAME']
     for env_var in required_envs:
         if not os.environ.get(env_var):
             raise ValueError(f"必須環境変数 '{env_var}' が設定されてないわよ！")
 
-    if not os.path.isdir(local_directory_path):
-        raise FileNotFoundError(f"ディレクトリ '{local_directory_path}' が見つからないか、ディレクトリじゃないわよ！")
+    s3_key = None
+    # S3イベントトリガーの場合、event['Records']からs3_keyを取得
+    if 'Records' in event: 
+        for record in event['Records']:
+            if 's3' in record:
+                s3_key = record['s3']['object']['key']
+                break
+    elif 's3_key' in event: # Step Functionsから直接keyが渡された場合
+        s3_key = event['s3_key']
 
-    es_client = get_elasticsearch_client()
-    total_indexed_files = 0
-    total_indexed_reports = 0
+    if not s3_key:
+        raise ValueError("S3オブジェクトキーがイベントまたはペイロードで指定されてないわよ！")
+    
+    print(f"S3からオブジェクト '{s3_key}' を読み込み中よ。")
 
     try:
-        # ディレクトリ内の全てのファイルとフォルダをリスト
-        for filename in os.listdir(local_directory_path):
-            if filename.endswith('.json'): # .jsonで終わるファイルだけを対象にする
-                file_path = os.path.join(local_directory_path, filename)
-                print(f"ファイル '{file_path}' を読み込み中よ。")
+        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        file_content = response['Body'].read().decode('utf-8')
+        reports_from_s3 = json.loads(file_content)
 
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        reports_from_file = json.load(f)
+        if not reports_from_s3:
+            print(f"S3オブジェクト '{s3_key}' に処理すべきレポートが見つからなかったわ。")
+            return {
+                "statusCode": 200,
+                "body": json.dumps("処理すべきレポートがなかったわ。")
+            }
 
-                    if not isinstance(reports_from_file, list):
-                        print(f"警告: ファイル '{file_path}' はJSONリスト形式じゃないみたい。スキップするわ。")
-                        continue
-                    
-                    if not reports_from_file:
-                        print(f"ファイル '{file_path}' に処理すべきレポートが見つからなかったわ。")
-                        continue
+        es_client = get_elasticsearch_client()
 
-                    successful_indexes_in_file = 0
-                    for report in reports_from_file:
-                        if index_data_to_elasticsearch(es_client, report):
-                            successful_indexes_in_file += 1
-                        
-                    total_indexed_reports += successful_indexes_in_file
-                    total_indexed_files += 1
-                    print(f"ファイル '{file_path}' から {successful_indexes_in_file} 件のレポートをインデックスしたわ。")
-
-                except json.JSONDecodeError as e:
-                    print(f"エラー: ファイル '{file_path}' のJSON解析に失敗したわ: {e}")
-                    traceback.print_exc()
-                    continue # 次のファイルへ
-                except Exception as e:
-                    print(f"ファイル '{file_path}' の処理中に予期せぬエラーが発生したわ: {e}")
-                    traceback.print_exc()
-                    continue # 次のファイルへ
-
-        if total_indexed_files == 0:
-            print("指定されたディレクトリにインデックスすべきJSONファイルが見つからなかったわ。")
+        successful_indexes = 0
+        for report in reports_from_s3:
+            if index_data_to_elasticsearch(es_client, report):
+                successful_indexes += 1
+            
+        if successful_indexes == len(reports_from_s3):
+            print(f"S3オブジェクト '{s3_key}' の全ての{successful_indexes}件のレポートをElasticsearchにインデックスしたわ。")
         else:
-            print(f"全ての処理が完了したわ。合計 {total_indexed_files} 個のファイルから {total_indexed_reports} 件のレポートをElasticsearchにインデックスしたわ。")
+            print(f"警告: S3オブジェクト '{s3_key}' の{len(reports_from_s3)}件中{successful_indexes}件のレポートしかElasticsearchにインデックスできなかったわ。")
+            # 部分的な失敗でも、Lambdaは成功とみなすか、エラーとするか、ポリシーによる
+            # 今回はエラーとして再試行を促す
+            raise Exception("一部のレポートのElasticsearchへのインデックスに失敗したわ。")
+                
+        print("全ての処理が完了したわ。")
+        return {
+            "statusCode": 200,
+            "body": json.dumps(f"S3オブジェクト '{s3_key}' の過去データインデックスが完了したわ！")
+        }
 
     except Exception as e:
-        print(f"メイン処理中に致命的なエラーが発生したわ: {e}")
-        traceback.print_exc()
-        raise # エラー発生時は処理を中断する
-
-# --- スクリプトのエントリポイント ---
-if __name__ == "__main__":
-    # コマンドライン引数からローカルディレクトリのパスを取得
-    # 例: python S3toEsHistoricalIndexer.py processed_sharepoint_reports/
-    import sys
-    if len(sys.argv) != 2:
-        print("使い方： python S3toEsHistoricalIndexer.py <ローカル_JSONディレクトリパス>")
-        sys.exit(1)
-    
-    local_directory_path = sys.argv[1]
-    
-    try:
-        index_local_directory_to_elasticsearch(local_directory_path)
-    except Exception as e:
-        print(f"Elasticsearchへのインデックス中にエラーが発生したわ: {e}")
-        sys.exit(1)
+        print(f"Lambda関数の実行中に致命的なエラーが発生したわ: {e}")
+        print(traceback.format_exc())
+        return {
+            "statusCode": 500,
+            "body": json.dumps(f"Lambda関数の実行中にエラーが発生したわ: {str(e)}")
+        }
