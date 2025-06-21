@@ -69,7 +69,7 @@ RAG処理の心臓部となるLambdaと、社内からのアクセスのみを�
 
 **作業の意味**: Lambda関数がAWSの他のサービスにアクセスし、ECSタスクがECRからイメージをプルしたりログを送信したりするための権限を付与します。
 
-1.  **Lambda 実行ロール (`lambda-rag-processor-role`)**:
+1.  **Lambda 実行ロール (`lambda-rag-processor-role-prod`)**:
       * **目的**: Lambda関数がRAG処理に必要なAWSサービス（Bedrock, DynamoDB）やCloudWatch Logsにアクセスするための権限を与えます。
       * AWSマネジメントコンソールにサインインし、**IAM** サービスへ移動します。
       * 左メニューから「**ロール**」を選び、「**ロールを作成**」をクリックします。
@@ -78,7 +78,8 @@ RAG処理の心臓部となるLambdaと、社内からのアクセスのみを�
           * `AWSLambdaBasicExecutionRole` (CloudWatch Logsへの基本権限)
           * `AmazonBedrockFullAccess` (Bedrockへのアクセス権限 - **本番では必要最小限に絞るべき**)
           * `AmazonDynamoDBFullAccess` (DynamoDBへのアクセス権限 - **本番では必要最小限に絞るべき**)
-      * 「ロール名」に「**`lambda-rag-processor-role`**」と入力し、「**ロールを作成**」をクリックします。
+          * `AWSLambdaVPCAccessExecutionRole` (VPC内のリソースへの基本権限)
+      * 「ロール名」に「**`lambda-rag-processor-role-prod`**」と入力し、「**ロールを作成**」をクリックします。
       * 作成されたロールの **ARN** を控えておきましょう。
 2.  **ECS タスク実行ロール (`ecs-task-execution-role-sg`)**:
       * **目的**: ECSがDockerイメージをECRから取得したり、ログをCloudWatchに送信したりするための権限を与えます。
@@ -184,7 +185,7 @@ RAG処理の心臓部となるLambdaと、社内からのアクセスのみを�
       * 「一から作成」を選び、「関数名」に「**`ChatbotBackendFunctionProd`**」と入力。
       * 「ランタイム」で「**Python 3.12**」を選択。
       * 「アーキテクチャ」は「`x86_64`」。
-      * 「実行ロール」セクションで「**既存のロールを使用する**」を選択し、先ほど作成した「`lambda-rag-processor-role`」を選択。
+      * 「実行ロール」セクションで「**既存のロールを使用する**」を選択し、先ほど作成した「`lambda-rag-processor-role-prod`」を選択。
       * 「**高度な設定**」を展開し、「**VPC**」セクションを設定します。
           * 「VPC」で、**既存のVPC ID**を選択。
           * 「サブネット」で、**プライベートサブネットのIDを複数選択**。
